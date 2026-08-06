@@ -1,0 +1,6 @@
+scratchpad/
+target/
+Cargo.lock
+*.dylib
+*.so
+*.dll
