@@ -5,6 +5,8 @@
 
 use gst::prelude::*;
 
+use std::time::{Duration, Instant};
+
 fn init() {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -78,6 +80,104 @@ fn harness(props: &[(&str, u32)]) -> gst_check::Harness {
     }
     h.set_src_caps_str("text/x-raw, format=utf8");
     h
+}
+
+fn gapkeeper_harness(props: &[(&str, u32)]) -> gst_check::Harness {
+    let mut h = gst_check::Harness::new("gapkeeper");
+    {
+        let el = h.element().unwrap();
+        for (name, value) in props {
+            el.set_property(name, *value);
+        }
+    }
+    h.set_src_caps_str("text/x-raw, format=utf8");
+    h
+}
+
+/// The gapkeeper must pass buffers through untouched (cue timing is upstream's
+/// business) and cover the pad with duration-less GAPs at the frontier.
+#[test]
+fn probe_gapkeeper_covers_silence_without_touching_buffers() {
+    init();
+    let mut h = gapkeeper_harness(&[("keepalive-ms", 100)]);
+    h.play();
+
+    let mut segment = gst::Segment::new();
+    segment.set_format(gst::Format::Time);
+    segment.set_start(ms(0));
+    assert!(h.push_event(gst::event::Segment::new(&segment)));
+    push_word(&mut h, 1000, 300, "Hello");
+
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        out.extend(drain(&mut h));
+    }
+
+    // The cue passes through at its exact PTS/duration.
+    let cues: Vec<_> = out
+        .iter()
+        .filter_map(|o| match o {
+            Out::Cue(start, end, text) => Some((*start, *end, text.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cues,
+        vec![(1000, 1300, "Hello".to_string())],
+        "gapkeeper must not alter buffer timing"
+    );
+    // Coverage GAPs sit at the observed frontier (start == end: no duration).
+    let gaps: Vec<_> = out
+        .iter()
+        .filter_map(|o| match o {
+            Out::Gap(start, end) => Some((*start, *end)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        gaps.iter().all(|(start, end)| start == end),
+        "gapkeeper GAPs must carry no duration: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().any(|(start, _)| *start >= 1000),
+        "coverage must reach the observed frontier: {gaps:?}"
+    );
+}
+
+/// A dead upstream must not pin a downstream mux: with stall-ms set, the
+/// frontier advances once upstream goes silent long enough.
+#[test]
+fn probe_gapkeeper_stall_advances_the_frontier() {
+    init();
+    let mut h = gapkeeper_harness(&[("keepalive-ms", 100), ("stall-ms", 500)]);
+    h.play();
+
+    let mut segment = gst::Segment::new();
+    segment.set_format(gst::Format::Time);
+    segment.set_start(ms(0));
+    assert!(h.push_event(gst::event::Segment::new(&segment)));
+    push_word(&mut h, 1000, 100, "Hello");
+
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(2_200);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        out.extend(drain(&mut h));
+    }
+    let gaps: Vec<_> = out
+        .iter()
+        .filter_map(|o| match o {
+            Out::Gap(start, end) => Some((*start, *end)),
+            _ => None,
+        })
+        .collect();
+    let furthest = gaps.iter().map(|(_, end)| *end).max().unwrap_or(0);
+    assert!(
+        furthest > 1000,
+        "stall watchdog must advance the frontier past the last cue; furthest {furthest}"
+    );
 }
 
 /// A stream that opens with silence must still advance downstream. This is the
