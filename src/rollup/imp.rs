@@ -22,6 +22,14 @@ const DEFAULT_LINES: u32 = 2;
 const DEFAULT_HOLD_MS: u32 = 250;
 const DEFAULT_PERSIST_MS: u32 = 1000;
 const DEFAULT_CLEAR_TIMEOUT_MS: u32 = 3000;
+
+/// Whether clearing the window also emits an empty cue.
+///
+/// Off by default: an empty cue is meaningful only to a downstream that reads
+/// one as "stop displaying", and formats that carry their own cue end have no
+/// use for it. Enabling it where it is not understood risks an empty caption
+/// rather than a cleared one.
+const DEFAULT_EMIT_CLEAR_CUE: bool = false;
 const DEFAULT_BREAK_ON_SENTENCE: bool = true;
 
 /// Smallest advance worth a gap event. Matches the transcriber's coalescing.
@@ -42,6 +50,7 @@ struct Settings {
     hold_ms: u32,
     persist_ms: u32,
     clear_timeout_ms: u32,
+    emit_clear_cue: bool,
     break_on_sentence: bool,
 }
 
@@ -53,6 +62,7 @@ impl Default for Settings {
             hold_ms: DEFAULT_HOLD_MS,
             persist_ms: DEFAULT_PERSIST_MS,
             clear_timeout_ms: DEFAULT_CLEAR_TIMEOUT_MS,
+            emit_clear_cue: DEFAULT_EMIT_CLEAR_CUE,
             break_on_sentence: DEFAULT_BREAK_ON_SENTENCE,
         }
     }
@@ -227,6 +237,23 @@ impl TextRollup {
         out.push(Out::Cue(start, end, text));
     }
 
+    /// Emit an empty cue announcing that the display is now blank.
+    ///
+    /// Zero-duration by construction: a clear is an instant on the timeline,
+    /// not a span. It carries no text, and a consumer that understands it
+    /// closes whatever cue is open and shows nothing in its place; one that
+    /// does not will treat it as an empty caption, which is why this is opt-in.
+    ///
+    /// Deliberately not routed through [`Self::queue_cue`]: that refuses a
+    /// non-positive span, because an ordinary cue with no duration is a bug.
+    /// The frontier is left where it was, so the following GAP still covers
+    /// the silence.
+    fn queue_clear(&self, state: &mut State, out: &mut Vec<Out>, at: gst::ClockTime) {
+        let at = state.out_pts.map_or(at, |out_pts| at.max(out_pts));
+        gst::debug!(CAT, imp = self, "clearing the display at {at}");
+        out.push(Out::Cue(at, at, String::new()));
+    }
+
     /// Close the timeline up to `end`.
     ///
     /// The start is always the published frontier, so callers cannot open a
@@ -386,6 +413,22 @@ impl TextRollup {
             state.window.clear();
             state.pending = None;
             state.last_word_pts = None;
+            // Announce the clear on the cue timeline, not just by going quiet.
+            //
+            // A GAP moves the frontier but says nothing about the display, so a
+            // transport whose cues carry no end — FLV script data, where a cue
+            // shows until replaced — cannot tell that the caption should come
+            // down. The consumer then has to invent an end from a timeout of
+            // its own, and the moment its timeout and `clear-timeout` differ,
+            // the caption disappears at the consumer's chosen time instead of
+            // this element's.
+            //
+            // An empty cue at `clear_at` is the same statement CEA-708 makes by
+            // erasing the display, expressed in the only vocabulary this
+            // transport has.
+            if settings.emit_clear_cue {
+                self.queue_clear(state, out, clear_at);
+            }
             self.queue_gap(state, out, frontier);
             return;
         }
@@ -655,6 +698,16 @@ impl ObjectImpl for TextRollup {
                     .default_value(DEFAULT_BREAK_ON_SENTENCE)
                     .mutable_playing()
                     .build(),
+                glib::ParamSpecBoolean::builder("emit-clear-cue")
+                    .nick("Emit Clear Cue")
+                    .blurb(
+                        "On clear-timeout, also emit an empty cue announcing that the \
+                         display is blank. Needed by transports whose cues carry no end \
+                         and therefore show until replaced, such as FLV script data",
+                    )
+                    .default_value(DEFAULT_EMIT_CLEAR_CUE)
+                    .mutable_playing()
+                    .build(),
             ]
         });
 
@@ -688,6 +741,7 @@ impl ObjectImpl for TextRollup {
             }
             "persist" => settings.persist_ms = value.get().unwrap(),
             "clear-timeout" => settings.clear_timeout_ms = value.get().unwrap(),
+            "emit-clear-cue" => settings.emit_clear_cue = value.get().unwrap(),
             "break-on-sentence" => {
                 settings.break_on_sentence = value.get().unwrap();
                 geometry_changed = true;
@@ -718,6 +772,7 @@ impl ObjectImpl for TextRollup {
             "hold" => settings.hold_ms.to_value(),
             "persist" => settings.persist_ms.to_value(),
             "clear-timeout" => settings.clear_timeout_ms.to_value(),
+            "emit-clear-cue" => settings.emit_clear_cue.to_value(),
             "break-on-sentence" => settings.break_on_sentence.to_value(),
             _ => unimplemented!(),
         }

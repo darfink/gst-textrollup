@@ -185,6 +185,25 @@ after 30 seconds of timestamped speech without a GAP event.
 | `persist` | 1000 ms | Duration of each silence re-emission; minimum 1 ms |
 | `clear-timeout` | 3000 ms | Silence before clearing; `0` disables clearing |
 | `break-on-sentence` | `true` | Finish the current line at `.`, `!`, `?`, or `…`, including trailing quotes/brackets |
+| `emit-clear-cue` | `false` | Also emit an empty cue at `clear-timeout`, announcing that the display is blank |
+
+### Announcing the clear
+
+`clear-timeout` decides when the window comes down, but a GAP only moves the
+frontier — it says nothing about the display. That is enough for a transport
+whose cues carry their own end, and not enough for one where a cue shows until
+something replaces it, such as FLV script data (`onCaption`/`onTextData`).
+
+With `emit-clear-cue`, the clear is stated on the cue timeline as a
+zero-duration empty cue at the clear position. A consumer that reads an empty
+cue as "stop displaying" then ends the caption exactly where this element
+decided, instead of inventing an end from a timeout of its own — which is what
+otherwise happens, and which makes the caption disappear at the consumer's
+chosen time rather than the publisher's.
+
+It is off by default because an empty cue is meaningless to a consumer that
+does not implement it: such a consumer will show an empty caption, or reject
+the cue outright, since a blank body terminates a WebVTT cue.
 
 All properties are readable and writable through the PAUSED and PLAYING states.
 

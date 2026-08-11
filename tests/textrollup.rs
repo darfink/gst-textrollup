@@ -149,6 +149,74 @@ fn gap_hold_and_persist_then_clear() {
 }
 
 #[test]
+fn emit_clear_cue_announces_the_blank_display_at_clear_timeout() {
+    init();
+    let mut h = gst_check::Harness::new("textrollup");
+    {
+        let el = h.element().unwrap();
+        el.set_property("hold", 200u32);
+        el.set_property("persist", 500u32);
+        el.set_property("clear-timeout", 1500u32);
+        el.set_property("break-on-sentence", false);
+        el.set_property("emit-clear-cue", true);
+    }
+    h.set_src_caps_str("text/x-raw, format=utf8");
+
+    push_word(&mut h, 1000, 50, "Hi");
+    assert!(h.push_event(gst::event::Gap::builder(ms(1000)).duration(ms(200)).build()));
+    let (_, _, text) = pull_cue(&mut h);
+    assert_eq!(text, "Hi");
+
+    assert!(h.push_event(gst::event::Gap::builder(ms(1200)).duration(ms(500)).build()));
+    let (_, _, text) = pull_cue(&mut h);
+    assert_eq!(text, "Hi");
+
+    // Clear at last_word(1000) + clear-timeout(1500) = 2500.
+    assert!(h.push_event(gst::event::Gap::builder(ms(1700)).duration(ms(900)).build()));
+    let (pts, dur, text) = pull_cue(&mut h);
+    assert_eq!(pts, ms(1700));
+    assert_eq!(dur, ms(800));
+    assert_eq!(text, "Hi");
+
+    // The clear itself: an empty cue at the position this element chose, so a
+    // consumer whose cues carry no end can close the caption there rather than
+    // inventing an end from a timeout of its own.
+    let (pts, dur, text) = pull_cue(&mut h);
+    assert_eq!(pts, ms(2500), "the clear must land at clear-timeout");
+    assert_eq!(dur, gst::ClockTime::ZERO, "a clear is an instant, not a span");
+    assert_eq!(text, "", "the clear carries no text");
+
+    assert!(h.try_pull().is_none());
+}
+
+#[test]
+fn the_clear_cue_stays_opt_in() {
+    // Default off: an empty cue means nothing to a transport whose cues carry
+    // their own end, and would show as an empty caption rather than a clear.
+    init();
+    let mut h = gst_check::Harness::new("textrollup");
+    {
+        let el = h.element().unwrap();
+        assert!(!el.property::<bool>("emit-clear-cue"));
+        el.set_property("hold", 200u32);
+        el.set_property("persist", 500u32);
+        el.set_property("clear-timeout", 1500u32);
+        el.set_property("break-on-sentence", false);
+    }
+    h.set_src_caps_str("text/x-raw, format=utf8");
+
+    push_word(&mut h, 1000, 50, "Hi");
+    assert!(h.push_event(gst::event::Gap::builder(ms(1000)).duration(ms(200)).build()));
+    let _ = pull_cue(&mut h);
+    assert!(h.push_event(gst::event::Gap::builder(ms(1200)).duration(ms(500)).build()));
+    let _ = pull_cue(&mut h);
+    assert!(h.push_event(gst::event::Gap::builder(ms(1700)).duration(ms(900)).build()));
+    let _ = pull_cue(&mut h);
+
+    assert!(h.try_pull().is_none(), "no clear cue unless asked for");
+}
+
+#[test]
 fn flush_stop_drops_pending() {
     init();
     let mut h = gst_check::Harness::new("textrollup");
