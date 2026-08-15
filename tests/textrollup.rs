@@ -11,270 +11,228 @@ fn init() {
     });
 }
 
-fn ms(v: u64) -> gst::ClockTime {
-    gst::ClockTime::from_mseconds(v)
+fn ms(value: u64) -> gst::ClockTime {
+    gst::ClockTime::from_mseconds(value)
 }
 
-fn push_word(h: &mut gst_check::Harness, pts_ms: u64, dur_ms: u64, text: &str) {
-    let mut buf = gst::Buffer::from_mut_slice(text.as_bytes().to_vec());
+fn harness(clear_after: u32) -> gst_check::Harness {
+    init();
+    let mut harness = gst_check::Harness::new("textrollup");
+    harness
+        .element()
+        .unwrap()
+        .set_property("clear-after", clear_after);
+    harness.set_src_caps_str("text/x-raw, format=utf8");
+    harness
+}
+
+fn buffer(pts_ms: u64, duration_ms: Option<u64>, text: &str) -> gst::Buffer {
+    let mut buffer = gst::Buffer::from_mut_slice(text.as_bytes().to_vec());
     {
-        let buf = buf.get_mut().unwrap();
-        buf.set_pts(ms(pts_ms));
-        buf.set_duration(ms(dur_ms));
+        let buffer = buffer.get_mut().unwrap();
+        buffer.set_pts(ms(pts_ms));
+        if let Some(duration_ms) = duration_ms {
+            buffer.set_duration(ms(duration_ms));
+        }
     }
-    assert_eq!(h.push(buf), Ok(gst::FlowSuccess::Ok));
+    buffer
 }
 
-fn pull_cue(h: &mut gst_check::Harness) -> (gst::ClockTime, gst::ClockTime, String) {
-    let buf = h.pull().expect("cue");
-    let pts = buf.pts().unwrap();
-    let dur = buf.duration().unwrap();
-    let map = buf.map_readable().unwrap();
-    let text = std::str::from_utf8(map.as_slice()).unwrap().to_string();
-    (pts, dur, text)
-}
-
-#[test]
-fn single_word_eos_emits_pending() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    {
-        let el = h.element().unwrap();
-        el.set_property("columns", 42u32);
-        el.set_property("lines", 2u32);
-        el.set_property("hold", 250u32);
-        el.set_property("clear-timeout", 0u32);
-    }
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 1000, 100, "Hello");
-    // No cue yet — held pending.
-    assert!(h.try_pull().is_none());
-
-    assert!(h.push_event(gst::event::Eos::new()));
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1000));
-    assert_eq!(dur, ms(250));
-    assert_eq!(text, "Hello");
-}
-
-#[test]
-fn next_word_closes_previous_exactly() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    {
-        let el = h.element().unwrap();
-        el.set_property("hold", 250u32);
-        el.set_property("clear-timeout", 0u32);
-        el.set_property("break-on-sentence", false);
-    }
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 1000, 80, "One");
-    push_word(&mut h, 1200, 80, "two");
-
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1000));
-    assert_eq!(dur, ms(200));
-    assert_eq!(text, "One");
-
-    assert!(h.push_event(gst::event::Eos::new()));
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1200));
-    assert_eq!(dur, ms(250));
-    assert_eq!(text, "One two");
-}
-
-#[test]
-fn overlong_word_is_its_own_line() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    {
-        let el = h.element().unwrap();
-        el.set_property("columns", 5u32);
-        el.set_property("lines", 2u32);
-        el.set_property("hold", 100u32);
-        el.set_property("clear-timeout", 0u32);
-        el.set_property("break-on-sentence", false);
-    }
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 0, 50, "toolong");
-    push_word(&mut h, 100, 50, "ok");
-    assert!(h.push_event(gst::event::Eos::new()));
-
-    let (_pts, _dur, first) = pull_cue(&mut h);
-    assert_eq!(first, "toolong");
-    let (_pts, _dur, second) = pull_cue(&mut h);
-    assert_eq!(second, "toolong\nok");
-}
-
-#[test]
-fn gap_hold_and_persist_then_clear() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    {
-        let el = h.element().unwrap();
-        el.set_property("hold", 200u32);
-        el.set_property("persist", 500u32);
-        el.set_property("clear-timeout", 1500u32);
-        el.set_property("break-on-sentence", false);
-    }
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 1000, 50, "Hi");
-    // Frontier to 1000+200 = hold close+reopen
-    assert!(h.push_event(gst::event::Gap::builder(ms(1000)).duration(ms(200)).build()));
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1000));
-    assert_eq!(dur, ms(200));
-    assert_eq!(text, "Hi");
-
-    // Persist chunk: pending now at 1200, persist 500 → emit at 1700
-    assert!(h.push_event(gst::event::Gap::builder(ms(1200)).duration(ms(500)).build()));
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1200));
-    assert_eq!(dur, ms(500));
-    assert_eq!(text, "Hi");
-
-    // Clear at silence_since(1000)+1500=2500
-    assert!(h.push_event(gst::event::Gap::builder(ms(1700)).duration(ms(900)).build()));
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1700));
-    assert_eq!(dur, ms(800)); // until clear at 2500
-    assert_eq!(text, "Hi");
-
-    // After clear, further gaps produce no more cues.
-    assert!(h.try_pull().is_none());
-}
-
-#[test]
-fn emit_clear_cue_announces_the_blank_display_at_clear_timeout() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    {
-        let el = h.element().unwrap();
-        el.set_property("hold", 200u32);
-        el.set_property("persist", 500u32);
-        el.set_property("clear-timeout", 1500u32);
-        el.set_property("break-on-sentence", false);
-        el.set_property("emit-clear-cue", true);
-    }
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 1000, 50, "Hi");
-    assert!(h.push_event(gst::event::Gap::builder(ms(1000)).duration(ms(200)).build()));
-    let (_, _, text) = pull_cue(&mut h);
-    assert_eq!(text, "Hi");
-
-    assert!(h.push_event(gst::event::Gap::builder(ms(1200)).duration(ms(500)).build()));
-    let (_, _, text) = pull_cue(&mut h);
-    assert_eq!(text, "Hi");
-
-    // Clear at last_word(1000) + clear-timeout(1500) = 2500.
-    assert!(h.push_event(gst::event::Gap::builder(ms(1700)).duration(ms(900)).build()));
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(1700));
-    assert_eq!(dur, ms(800));
-    assert_eq!(text, "Hi");
-
-    // The clear itself: an empty cue at the position this element chose, so a
-    // consumer whose cues carry no end can close the caption there rather than
-    // inventing an end from a timeout of its own.
-    let (pts, dur, text) = pull_cue(&mut h);
-    assert_eq!(pts, ms(2500), "the clear must land at clear-timeout");
-    assert_eq!(dur, gst::ClockTime::ZERO, "a clear is an instant, not a span");
-    assert_eq!(text, "", "the clear carries no text");
-
-    assert!(h.try_pull().is_none());
-}
-
-#[test]
-fn the_clear_cue_stays_opt_in() {
-    // Default off: an empty cue means nothing to a transport whose cues carry
-    // their own end, and would show as an empty caption rather than a clear.
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    {
-        let el = h.element().unwrap();
-        assert!(!el.property::<bool>("emit-clear-cue"));
-        el.set_property("hold", 200u32);
-        el.set_property("persist", 500u32);
-        el.set_property("clear-timeout", 1500u32);
-        el.set_property("break-on-sentence", false);
-    }
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 1000, 50, "Hi");
-    assert!(h.push_event(gst::event::Gap::builder(ms(1000)).duration(ms(200)).build()));
-    let _ = pull_cue(&mut h);
-    assert!(h.push_event(gst::event::Gap::builder(ms(1200)).duration(ms(500)).build()));
-    let _ = pull_cue(&mut h);
-    assert!(h.push_event(gst::event::Gap::builder(ms(1700)).duration(ms(900)).build()));
-    let _ = pull_cue(&mut h);
-
-    assert!(h.try_pull().is_none(), "no clear cue unless asked for");
-}
-
-#[test]
-fn flush_stop_drops_pending() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    h.set_src_caps_str("text/x-raw, format=utf8");
-
-    push_word(&mut h, 1000, 50, "Hello");
-    assert!(h.push_event(gst::event::FlushStart::new()));
-    assert!(h.push_event(gst::event::FlushStop::new(true)));
-    assert!(h.push_event(gst::event::Eos::new()));
-    assert!(h.try_pull().is_none());
-}
-
-#[test]
-fn latency_query_adds_hold() {
-    init();
-    let mut h = gst_check::Harness::new_parse("identity ! textrollup hold=250 name=r");
-    h.set_src_caps_str("text/x-raw, format=utf8");
-    h.play();
-
-    let el = h.element().unwrap();
-    let src = el.static_pad("src").unwrap();
-    let mut q = gst::query::Latency::new();
-    assert!(src.query(&mut q));
-    let (_live, min, _max) = q.result();
-    assert!(min >= ms(250), "min latency {min} should include hold");
-}
-
-#[test]
-fn empty_stream_eos() {
-    init();
-    let mut h = gst_check::Harness::new("textrollup");
-    h.set_src_caps_str("text/x-raw, format=utf8");
-    assert!(h.push_event(gst::event::Eos::new()));
-    assert!(h.try_pull().is_none());
-}
-
-#[test]
-fn hold_change_posts_latency_message() {
-    init();
-
-    let pipeline = gst::Pipeline::default();
-    let el = gst::ElementFactory::make("textrollup")
-        .name("r")
-        .build()
-        .unwrap();
-    pipeline.add(&el).unwrap();
-    pipeline.set_state(gst::State::Paused).unwrap();
-
-    let bus = pipeline.bus().expect("pipeline bus");
-    // Drain any startup messages.
-    while bus.pop().is_some() {}
-
-    el.set_property("hold", 500u32);
-
-    let msg = bus.timed_pop_filtered(
-        gst::ClockTime::from_seconds(1),
-        &[gst::MessageType::Latency],
+fn push(harness: &mut gst_check::Harness, pts_ms: u64, duration_ms: u64, text: &str) {
+    assert_eq!(
+        harness.push(buffer(pts_ms, Some(duration_ms), text)),
+        Ok(gst::FlowSuccess::Ok)
     );
-    assert!(msg.is_some(), "expected LATENCY message after hold change");
-    let _ = pipeline.set_state(gst::State::Null);
+}
+
+fn pull(harness: &mut gst_check::Harness) -> (u64, u64, String) {
+    let buffer = harness.pull().expect("caption state");
+    let map = buffer.map_readable().unwrap();
+    (
+        buffer.pts().unwrap().mseconds(),
+        buffer.duration().unwrap().mseconds(),
+        std::str::from_utf8(map.as_slice()).unwrap().to_owned(),
+    )
+}
+
+fn push_gap(harness: &mut gst_check::Harness, start_ms: u64, duration_ms: u64) {
+    assert!(
+        harness.push_event(
+            gst::event::Gap::builder(ms(start_ms))
+                .duration(ms(duration_ms))
+                .build()
+        )
+    );
+}
+
+fn pull_gaps(harness: &mut gst_check::Harness) -> Vec<(u64, u64)> {
+    let mut gaps = Vec::new();
+    while let Some(event) = harness.try_pull_event() {
+        if let gst::EventView::Gap(gap) = event.view() {
+            let (start, duration) = gap.get();
+            gaps.push((start.mseconds(), duration.unwrap().mseconds()));
+        }
+    }
+    gaps
+}
+
+#[test]
+fn first_word_is_immediate_and_preserves_timing() {
+    let mut harness = harness(3000);
+    push(&mut harness, 1000, 83, "Hello");
+    assert_eq!(pull(&mut harness), (1000, 83, "Hello".into()));
+}
+
+#[test]
+fn every_committed_buffer_produces_one_complete_state() {
+    let mut harness = harness(0);
+    harness
+        .element()
+        .unwrap()
+        .set_property("break-on-sentence", false);
+    push(&mut harness, 1000, 80, "One");
+    push(&mut harness, 1200, 90, "two words");
+    assert_eq!(pull(&mut harness), (1000, 80, "One".into()));
+    assert_eq!(pull(&mut harness), (1200, 90, "One two words".into()));
+    assert!(harness.try_pull().is_none());
+}
+
+#[test]
+fn requires_duration_and_nonzero_duration() {
+    let mut harness = harness(0);
+    assert_eq!(
+        harness.push(buffer(1000, None, "word")),
+        Err(gst::FlowError::Error)
+    );
+    assert_eq!(
+        harness.push(buffer(1000, Some(0), "word")),
+        Err(gst::FlowError::Error)
+    );
+}
+
+#[test]
+fn short_silence_preserves_the_window() {
+    let mut harness = harness(3000);
+    push(&mut harness, 1000, 100, "Hello");
+    push_gap(&mut harness, 1100, 2500);
+    push(&mut harness, 3600, 100, "again");
+    assert_eq!(pull(&mut harness).2, "Hello");
+    assert_eq!(pull(&mut harness).2, "Hello again");
+}
+
+#[test]
+fn gap_crossing_deadline_splits_around_one_clear() {
+    let mut harness = harness(3000);
+    push(&mut harness, 1000, 100, "Hello");
+    assert_eq!(pull(&mut harness).2, "Hello");
+    push_gap(&mut harness, 1100, 4000);
+    assert_eq!(pull(&mut harness), (4100, 0, String::new()));
+    assert!(harness.try_pull().is_none(), "clear is emitted only once");
+    assert_eq!(pull_gaps(&mut harness), vec![(1100, 3000), (4100, 1000)]);
+}
+
+#[test]
+fn later_word_emits_missed_clear_at_media_deadline() {
+    let mut harness = harness(3000);
+    push(&mut harness, 1000, 100, "old");
+    assert_eq!(pull(&mut harness).2, "old");
+    push(&mut harness, 5000, 100, "new");
+    assert_eq!(pull(&mut harness), (4100, 0, String::new()));
+    assert_eq!(pull(&mut harness), (5000, 100, "new".into()));
+}
+
+#[test]
+fn explicit_empty_input_clears_and_resets() {
+    let mut harness = harness(0);
+    push(&mut harness, 1000, 100, "old words");
+    assert_eq!(pull(&mut harness).2, "old words");
+    assert_eq!(
+        harness.push(buffer(1500, None, "")),
+        Ok(gst::FlowSuccess::Ok)
+    );
+    assert_eq!(pull(&mut harness), (1500, 0, String::new()));
+    push(&mut harness, 2000, 100, "fresh");
+    assert_eq!(pull(&mut harness).2, "fresh");
+}
+
+#[test]
+fn clear_after_zero_never_generates_a_clear() {
+    let mut harness = harness(0);
+    push(&mut harness, 1000, 100, "old");
+    assert_eq!(pull(&mut harness).2, "old");
+    push_gap(&mut harness, 1100, 10_000);
+    assert!(harness.try_pull().is_none());
+}
+
+#[test]
+fn sentence_and_width_scrolls_never_emit_blank_state() {
+    let mut harness = harness(0);
+    {
+        let element = harness.element().unwrap();
+        element.set_property("columns", 12u32);
+        element.set_property("lines", 2u32);
+        assert!(element.property::<bool>("break-on-sentence"));
+    }
+    for (pts, text) in [
+        (0, "Hello"),
+        (100, "world."),
+        (200, "Next"),
+        (300, "longword"),
+    ] {
+        push(&mut harness, pts, 50, text);
+    }
+    let states: Vec<_> = (0..4).map(|_| pull(&mut harness).2).collect();
+    assert_eq!(states[1], "Hello world.");
+    assert_eq!(states[2], "Hello world.\nNext");
+    assert!(states.iter().all(|state| !state.is_empty()));
+}
+
+#[test]
+fn flush_stop_drops_the_old_window() {
+    let mut harness = harness(0);
+    push(&mut harness, 1000, 50, "stale");
+    assert_eq!(pull(&mut harness).2, "stale");
+    assert!(harness.push_event(gst::event::FlushStart::new()));
+    assert!(harness.push_event(gst::event::FlushStop::new(true)));
+    push(&mut harness, 2000, 50, "fresh");
+    assert_eq!(pull(&mut harness).2, "fresh");
+}
+
+#[test]
+fn latency_query_adds_no_formatter_latency() {
+    init();
+    let mut harness = gst_check::Harness::new_parse("identity ! textrollup name=r");
+    harness.set_src_caps_str("text/x-raw, format=utf8");
+    harness.play();
+    let src = harness.element().unwrap().static_pad("src").unwrap();
+    let mut query = gst::query::Latency::new();
+    assert!(src.query(&mut query));
+    let (_live, min, _max) = query.result();
+    assert_eq!(min, gst::ClockTime::ZERO);
+}
+
+#[test]
+fn repeated_runs_have_identical_media_time_output() {
+    fn run() -> Vec<(u64, u64, String)> {
+        let mut harness = harness(3000);
+        push(&mut harness, 1000, 100, "one");
+        push(&mut harness, 1200, 100, "two");
+        push_gap(&mut harness, 1300, 4000);
+        let mut output = Vec::new();
+        while harness.buffers_in_queue() > 0 {
+            output.push(pull(&mut harness));
+        }
+        output
+    }
+    assert_eq!(run(), run());
+    assert_eq!(run().last().unwrap().0, 4300);
+}
+
+#[test]
+fn removed_transport_workaround_properties_are_absent() {
+    let harness = harness(3000);
+    let element = harness.element().unwrap();
+    for name in ["hold", "persist", "clear-timeout", "emit-clear-cue"] {
+        assert!(element.find_property(name).is_none(), "{name} still exists");
+    }
 }

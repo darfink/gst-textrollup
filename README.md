@@ -18,8 +18,8 @@ account for most of the design:
 
 - **Nothing already on screen moves.** A line's text is decided once, when it
   fills, and is never recomputed.
-- **A cue is emitted the moment a word commits**, rather than batched toward a
-  sentence boundary, so the only latency the element adds is its `hold`.
+- **A state is emitted the moment input commits**, rather than batched toward a
+  sentence boundary. The element adds no formatter latency.
 
 In the position it is meant for it replaces `textaccumulate` + `textwrap`,
 because owning the line breaking is precisely what makes the first property
@@ -57,10 +57,9 @@ the work happening` at `columns=42 lines=2`, one word every 240 ms:
 `one of the things that's great about` is decided at 00:01.440 and is
 byte-identical in every later cue until it scrolls off at 00:03.840.
 
-Each cue carries the **entire** window and ends exactly where the next one
-begins, so exactly one cue is ever on screen. Overlapping cues would be the
-other way to express a scrolling window, but players stack those rather than
-replacing them, which defeats the purpose.
+Each output carries the **entire** visible window as a replacement state and
+preserves the input buffer's PTS and duration exactly. Lifecycle is explicit:
+the state remains active until another state or an empty clear replaces it.
 
 ### Why not wrap the text instead
 
@@ -108,7 +107,7 @@ model. After installing or exposing both plugins to GStreamer, run:
 gst-launch-1.0 filesrc location=speech.wav ! decodebin ! audioconvert ! audioresample \
   ! transcribecpptranscriber mode=stream backend=cpu \
       model-path=nemotron-speech-streaming-en-0.6b-Q8_0.gguf \
-  ! textrollup columns=42 lines=2 hold=250 \
+  ! textrollup columns=42 lines=2 clear-after=3000 \
   ! fakesink dump=true
 ```
 
@@ -151,9 +150,10 @@ affect future wrapping only: lines that are already frozen keep the geometry
 they were built with, since un-freezing them is the one thing this element
 exists to avoid.
 
-The element accepts word-level buffers. If a buffer contains multiple words,
-they are split at whitespace and share that buffer's PTS as a degraded-input
-fallback. Buffers must have a PTS and valid UTF-8.
+The element accepts one or more committed words per buffer. It processes every
+word but emits only the final complete window, so the one-input/one-output
+contract is retained. Non-empty buffers must contain valid UTF-8 and have a PTS
+and non-zero duration. An empty UTF-8 buffer is an explicit clear at its PTS.
 
 ## Silence and timing
 
@@ -161,19 +161,17 @@ The element uses media-time GAP events rather than a wall-clock timer:
 
 | Property | Default | Meaning |
 | --- | ---: | --- |
-| `hold` | 250 ms | Maximum wait for a successor word before closing the current cue; contributes to latency |
-| `persist` | 1000 ms | Duration of each identical re-emitted cue during silence |
-| `clear-timeout` | 3000 ms | Silence after which the window clears; `0` never clears |
+| `clear-after` | 3000 ms | Media-time silence after the previous input end before an explicit clear; `0` never clears |
 
-After `hold`, the current caption is closed and reopened. During a longer
-silence, `persist` keeps the display continuous with identical caption buffers.
-Once `clear-timeout` is reached, the window is cleared and the remaining
-timeline is emitted as GAP events.
+When a GAP crosses `last_input_end + clear-after`, the element splits the GAP,
+emits one zero-duration empty UTF-8 buffer at that exact media timestamp, and
+resets its internal window. A later word performs the same missed-clear check
+if upstream omitted GAP events. No wall-clock timer or HLS cadence participates.
 
-Upstream should announce silence with GAP events. Without them, the element can
-still close cues when later words arrive, but it cannot advance persistence or
-clear-timeout during an otherwise silent stream. A diagnostic warning is emitted
-after 30 seconds of timestamped speech without a GAP event.
+Upstream should announce silence with GAP events so the clear is published
+while silence is in progress. If it does not, the first later word still emits
+the missed clear at the original media-time deadline before starting a clean
+window.
 
 ## Properties
 
@@ -181,29 +179,15 @@ after 30 seconds of timestamped speech without a GAP event.
 | --- | ---: | --- |
 | `columns` | 42 | Maximum display width per line |
 | `lines` | 2 | Number of lines in the roll-up window |
-| `hold` | 250 ms | Holdback before closing a cue; minimum 1 ms |
-| `persist` | 1000 ms | Duration of each silence re-emission; minimum 1 ms |
-| `clear-timeout` | 3000 ms | Silence before clearing; `0` disables clearing |
+| `clear-after` | 3000 ms | Media-time silence after the last input end before clearing; `0` disables clearing |
 | `break-on-sentence` | `true` | Finish the current line at `.`, `!`, `?`, or `…`, including trailing quotes/brackets |
-| `emit-clear-cue` | `false` | Also emit an empty cue at `clear-timeout`, announcing that the display is blank |
 
 ### Announcing the clear
 
-`clear-timeout` decides when the window comes down, but a GAP only moves the
-frontier — it says nothing about the display. That is enough for a transport
-whose cues carry their own end, and not enough for one where a cue shows until
-something replaces it, such as FLV script data (`onCaption`/`onTextData`).
-
-With `emit-clear-cue`, the clear is stated on the cue timeline as a
-zero-duration empty cue at the clear position. A consumer that reads an empty
-cue as "stop displaying" then ends the caption exactly where this element
-decided, instead of inventing an end from a timeout of its own — which is what
-otherwise happens, and which makes the caption disappear at the consumer's
-chosen time rather than the publisher's.
-
-It is off by default because an empty cue is meaningless to a consumer that
-does not implement it: such a consumer will show an empty caption, or reject
-the cue outright, since a blank body terminates a WebVTT cue.
+The empty buffer at `clear-after` is authoritative. Replacement-state
+transports such as FLV script data consume it as “stop displaying”; downstream
+packagers must not invent another timeout. Setting `clear-after=0` delegates
+the lifecycle to an explicit empty input instead.
 
 All properties are readable and writable through the PAUSED and PLAYING states.
 
@@ -215,12 +199,13 @@ The sink and source pads both carry:
 text/x-raw, format=utf8
 ```
 
-Every input buffer must have a timestamp. The element forwards stream-start,
+Every input buffer must have a timestamp. Non-empty buffers also require a
+non-zero duration. The element forwards stream-start,
 segment, flush, and relevant custom downstream events. A new segment clears the
 caption window so text from the previous timeline cannot leak into the new one.
 
-The element reports its `hold` value as additional downstream latency and posts
-a LATENCY message when that property changes.
+The element reports upstream latency unchanged; formatting contributes no
+additional latency.
 
 ## Debugging
 
@@ -228,8 +213,8 @@ a LATENCY message when that property changes.
 GST_DEBUG=textrollup:6 gst-launch-1.0 ...
 ```
 
-Logs include timeline anchoring, GAP handling, cue ranges, rendered text, and
-diagnostics for missing timestamps or missing upstream GAP events.
+Logs include GAP splitting, clear positions, rendered state, and diagnostics
+for missing timing or invalid UTF-8.
 
 ## Tests
 
@@ -239,10 +224,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-The suite covers the pure roll-up window, a fixture oracle, GStreamer holdback,
-GAP persistence and clearing, EOS, flush, latency, leading/trailing silence,
-fine-grained GAPs, multi-word buffers, timeline tiling, and fixation of
-completed lines.
+The suite covers the pure roll-up window, a fixture oracle, immediate output,
+exact timing preservation, media-time clearing, missed GAP recovery, flush,
+zero formatter latency, multi-word buffers, punctuation/width scrolling, and
+fixation of completed lines.
 
 ## Status and limitations
 
